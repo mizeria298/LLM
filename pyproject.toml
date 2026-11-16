@@ -1,0 +1,47 @@
+[project]
+name = "llm"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Rafał Ogórek", email = "rafal.ogorek@ardigen.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    # PyTorch z CUDA 11.8 - GTX 970 (Maxwell, sm_52) nie jest wspierany w buildach cu128+
+    "torch (==2.7.1)",
+    "torchvision (==0.22.1)",
+    # Hugging Face
+    # tokenizers / huggingface-hub / safetensors przychodzą z transformers
+    "transformers (>=5.0)",
+    "datasets (>=4.0)",
+    "accelerate (>=1.0)",
+    # Data science
+    "numpy",
+    "scipy",
+    "pandas",
+    "scikit-learn",
+    "matplotlib",
+    "seaborn",
+    # Jupyter
+    "jupyter",
+    "ipykernel",
+    "ipywidgets",
+    "tiktoken (>=0.14.0,<0.15.0)",
+]
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.dependencies]
+torch = { source = "pytorch-cu118" }
+torchvision = { source = "pytorch-cu118" }
+
+[[tool.poetry.source]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+priority = "explicit"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
