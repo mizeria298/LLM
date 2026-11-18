@@ -1,0 +1,47 @@
+[project]
+name = "llm"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Rafał Ogórek", email = "rafal.ogorek@ardigen.com"}
+]
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # PyTorch z CUDA 12.8 - A100 (sm_80), driver 570 (CUDA 12.8)
+    "torch (>=2.9)",
+    "torchvision (>=0.24)",
+    # Hugging Face
+    # tokenizers / huggingface-hub / safetensors przychodzą z transformers
+    "transformers (>=5.0)",
+    "datasets (>=4.0)",
+    "accelerate (>=1.0)",
+    # Data science
+    "numpy",
+    "scipy",
+    "pandas",
+    "scikit-learn",
+    "matplotlib",
+    "seaborn",
+    # Jupyter
+    "jupyter",
+    "ipykernel",
+    "ipywidgets",
+    "tiktoken (>=0.14.0,<0.15.0)",
+]
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.dependencies]
+torch = { source = "pytorch-cu128" }
+torchvision = { source = "pytorch-cu128" }
+
+[[tool.poetry.source]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+priority = "explicit"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
