@@ -36,11 +36,12 @@ from torch.nn import functional as F
 from transformers import GPT2LMHeadModel
 
 # -----------------------------------------------------------------------------
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "hellaswag")
+DATA_CACHE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "resources", "hellaswag"))
 
 def download_file(url: str, fname: str, chunk_size=1024):
     """Helper function to download a file from a given url"""
     resp = requests.get(url, stream=True)
+    resp.raise_for_status()
     total = int(resp.headers.get("content-length", 0))
     with open(fname, "wb") as file, tqdm(
         desc=fname,
@@ -53,22 +54,39 @@ def download_file(url: str, fname: str, chunk_size=1024):
             size = file.write(data)
             bar.update(size)
 
+# The original GitHub repo (rowanz/hellaswag) was taken down (DMCA, Sept 2026),
+# so we download the Hugging Face copy (parquet) and convert it to the original jsonl format.
+HF_BASE = "https://huggingface.co/datasets/Rowan/hellaswag/resolve/main/data"
 hellaswags = {
-    "train": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_train.jsonl",
-    "val": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl",
-    "test": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_test.jsonl",
+    "train": f"{HF_BASE}/train-00000-of-00001.parquet",
+    "val": f"{HF_BASE}/validation-00000-of-00001.parquet",
+    "test": f"{HF_BASE}/test-00000-of-00001.parquet",
 }
 
 enc = tiktoken.get_encoding("gpt2")
 
 def download(split):
-    """Downloads HellaSwag DATA_CACHE_DIR"""
+    """Downloads HellaSwag to DATA_CACHE_DIR as hellaswag_{split}.jsonl"""
+    import pandas as pd
     os.makedirs(DATA_CACHE_DIR, exist_ok=True)
     data_url = hellaswags[split]
     data_filename = os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl")
-    if not os.path.exists(data_filename):
-        print(f"Downloading {data_url} to {data_filename}...")
-        download_file(data_url, data_filename)
+    if os.path.exists(data_filename):
+        return
+    parquet_filename = os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.parquet")
+    print(f"Downloading {data_url} to {parquet_filename}...")
+    download_file(data_url, parquet_filename)
+    df = pd.read_parquet(parquet_filename)
+    tmp_filename = data_filename + ".tmp"
+    with open(tmp_filename, "w") as f:
+        for row in df.to_dict(orient="records"):
+            row["endings"] = list(row["endings"])
+            # HF stores labels as strings ("0".."3"); test split has no labels ("")
+            row["label"] = int(row["label"]) if row["label"] != "" else -1
+            row["ind"] = int(row["ind"])
+            f.write(json.dumps(row) + "\n")
+    os.replace(tmp_filename, data_filename)  # atomic: never leave a partial jsonl behind
+    os.remove(parquet_filename)
 
 def render_example(example):
     """

@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Datasets (regenerate with 04_gpt2/fineweb.py / hellaswag.download) and reference repos
+resources/
+
+# Training logs and checkpoints
+04_gpt2/log/
+05_tiny_llama/log/

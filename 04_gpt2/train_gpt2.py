@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import copy
 import tiktoken
 import time
 import inspect
@@ -13,6 +14,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from hellaswag import render_example, iterate_examples
 
+# datasets live in <repo>/resources; the log and checkpoints go next to this script
+DATA_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "resources", "edu_fineweb10B"))
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log")
 
 
 @dataclass
@@ -202,48 +206,118 @@ class GPT(nn.Module):
         return model
 
 
-def load_tokens(filename):
+EOT_TOKEN = 50256  # <|endoftext|>, the first token of every document
+
+
+def load_tokens(filename, shuffle_rng=None):
     npt = np.load(filename)
+    if shuffle_rng is not None:
+        npt = shuffle_documents(npt, shuffle_rng)
     ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
 
 
+def shuffle_documents(tokens, rng):
+    """Randomly reorders the documents in a shard. Documents start at EOT tokens. The piece
+    before the first EOT (the tail of a document that began in the previous shard) is dropped,
+    so the result is leading_fragment_len(...) tokens shorter than the shard."""
+    starts = np.flatnonzero(tokens == EOT_TOKEN)
+    docs = np.split(tokens, starts)[1:]  # [0] is the leading fragment (empty if the shard starts with EOT)
+    docs = [docs[i] for i in rng.permutation(len(docs))]
+    return np.concatenate(docs)
+
+
+def leading_fragment_len(filename, chunk=1 << 20):
+    """Number of tokens before the first EOT in a shard, read via mmap without loading the shard."""
+    a = np.load(filename, mmap_mode="r")
+    for start in range(0, len(a), chunk):
+        hits = np.flatnonzero(np.asarray(a[start:start + chunk]) == EOT_TOKEN)
+        if len(hits):
+            return start + int(hits[0])
+    return len(a)
+
+
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, split):
-        self.B = B
+    """Streams (B, T) batches from token shards; B is passed on each call.
+    current_position is the same on all ranks; each rank reads its own B*T slice after it.
+    self.epoch counts completed passes over all shards.
+    With shuffle=True, every epoch (including the first) uses a new random shard order and
+    a random document order within each shard; each shard's leading partial document is dropped. Both are seeded by (seed, epoch[, shard]), so
+    every rank, and every copy of the loader, sees exactly the same data order."""
+    def __init__(self, T, process_rank, num_processes, split, shuffle=False, seed=1337):
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        self.shuffle = shuffle
+        self.seed = seed
         assert split in ("train", "val")
 
-        data_root = "edu_fineweb10B"
+        data_root = DATA_ROOT
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
         shards = sorted(shards)
         shards = [os.path.join(data_root, s) for s in shards]
         self.shards = shards
         assert len(shards) > 0, f"no shards found for split {split}"
+        self.shard_lens = [len(np.load(s, mmap_mode="r")) for s in shards]  # header only, cheap
+        if shuffle:  # shuffling drops each shard's leading fragment (see shuffle_documents)
+            self.shard_lens = [L - leading_fragment_len(s) for L, s in zip(self.shard_lens, shards)]
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
         self.reset()
 
     def reset(self):
-        self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.B * self.T * self.process_rank
+        self.epoch = 0
+        self._start_epoch()
 
+    def _start_epoch(self):
+        if self.shuffle:
+            self.shard_order = np.random.default_rng((self.seed, self.epoch)).permutation(len(self.shards))
+        else:
+            self.shard_order = np.arange(len(self.shards))
+        self.current_shard = 0  # index into shard_order
+        self.current_position = 0
+        self.tokens = None  # loaded lazily, so dry runs never touch token data
 
-    def next_batch(self):
-        B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-        x = (buf[:-1]).view(B, T)
-        y = (buf[1:]).view(B, T)
+    def _shard_len(self):
+        return self.shard_lens[self.shard_order[self.current_shard]]
+
+    def _load_current_shard(self):
+        shard_idx = self.shard_order[self.current_shard]
+        rng = None
+        if self.shuffle:
+            rng = np.random.default_rng((self.seed, self.epoch, int(shard_idx)))
+        return load_tokens(self.shards[shard_idx], shuffle_rng=rng)
+
+    def _fits(self, B):
+        # the last rank reads up to current_position + B*T*num_processes + 1
+        return self.current_position + B * self.T * self.num_processes + 1 <= self._shard_len()
+
+    def _next_shard(self):
+        if self.current_shard + 1 == len(self.shards):
+            self.epoch += 1
+            self._start_epoch()  # new shard order for the next epoch
+        else:
+            self.current_shard += 1
+            self.current_position = 0
+            self.tokens = None
+
+    def next_batch(self, B, dry_run=False):
+        """Returns (x, y) of shape (B, T). With dry_run=True only advances the position (returns None)."""
+        T = self.T
+        if not self._fits(B):  # B may have grown since the last call
+            self._next_shard()
+        out = None
+        if not dry_run:
+            if self.tokens is None:
+                self.tokens = self._load_current_shard()
+            start = self.current_position + B * T * self.process_rank
+            buf = self.tokens[start : start + B * T + 1]
+            out = (buf[:-1]).view(B, T), (buf[1:]).view(B, T)
         self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes+ 1) > len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = self.B * self.T * self.process_rank
-        return x, y
+        if not self._fits(B):  # switch right away so an epoch ends on its last batch
+            self._next_shard()
+        return out
 
 
 def get_most_likely_row(tokens, mask, logits):
@@ -298,17 +372,36 @@ if __name__ == "__main__":
         
     
 
-    total_batch_size = 524288
-    B = 32
+    # ---- batch size: fixed 0.5M tokens per step, no ramp (as in Karpathy's build-nanogpt) ----
+    total_batch_size = 524288       # 2**19, ~0.5M tokens per step
+    B_max = 32                      # micro-batch per GPU (Karpathy used 64 on 80GB A100s; 32 fits 40GB)
     T = 1024
-    assert total_batch_size % (B * T * ddp_world_size) == 0
-    grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+    assert total_batch_size % (B_max * T * ddp_world_size) == 0
+    grad_accum = total_batch_size // (B_max * T * ddp_world_size)
     if master_process:
-        print(f"total desired batch size: {total_batch_size}")
-        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
-    
-    train_loader = DataLoaderLite(B, T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-    val_loader = DataLoaderLite(B, T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+        print(f"total batch size: {total_batch_size}, grad accumulation steps: {grad_accum}")
+
+    train_loader = DataLoaderLite(T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train", shuffle=True)
+    val_loader = DataLoaderLite(T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+
+    # ---- precompute the whole run with a dry run of the data loader ----
+    # Deterministic and identical on every rank: the exact number of steps in num_epochs passes over
+    # the train shards (each shard's tail is skipped) and the steps on which each epoch ends.
+    num_epochs = 5
+    plan = []             # per step: (B, grad_accum_steps, tokens_seen_before_step)
+    epoch_end_steps = {}  # step -> number of the epoch that ends on that step
+    sim = copy.copy(train_loader)
+    tokens_seen = 0
+    while sim.epoch < num_epochs:
+        B, accum = B_max, grad_accum
+        for _ in range(accum):
+            sim.next_batch(B, dry_run=True)
+        plan.append((B, accum, tokens_seen))
+        tokens_seen += B * T * accum * ddp_world_size
+        if sim.epoch > len(epoch_end_steps):
+            epoch_end_steps[len(plan) - 1] = sim.epoch
+    max_steps = len(plan)
+    total_tokens = tokens_seen
 
     torch.set_float32_matmul_precision("high")
     
@@ -325,10 +418,12 @@ if __name__ == "__main__":
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
 
+    # ---- learning rate schedule (Karpathy's build-nanogpt) ----
+    # linear warmup over 715 steps (~375M tokens, the GPT-3 warmup), then cosine decay to 10% of
+    # max_lr over the rest of the run, so the decay always completes at the last step
     max_lr = 6e-4
     min_lr = max_lr * 0.1
     warmup_steps = 715
-    max_steps = 19073
     def get_lr(it):
         if it < warmup_steps:
             return max_lr * (it+1) / warmup_steps
@@ -339,13 +434,19 @@ if __name__ == "__main__":
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return min_lr + coeff * (max_lr - min_lr)
 
+    if master_process:
+        print(f"epochs: {num_epochs}, total tokens: {total_tokens:,}, steps: {max_steps}")
+        print(f"lr: warmup {warmup_steps} steps to {max_lr:.1e}, cosine to {min_lr:.1e} at step {max_steps}")
+        print(f"epoch ends (checkpoints) at steps: {sorted(epoch_end_steps)}")
+
     optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
-    log_dir = "log"
+    log_dir = LOG_DIR
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"log.txt")
     with open(log_file, "w") as f:
         pass
+    last_val_loss = None
 
     for step in range(max_steps):
         t0 = time.time()
@@ -358,7 +459,7 @@ if __name__ == "__main__":
                 val_loss_accum = 0.0
                 val_loss_steps = 20
                 for _ in range(val_loss_steps):
-                    x, y = val_loader.next_batch()
+                    x, y = val_loader.next_batch(B_max)
                     x, y = x.to(device), y.to(device)
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                         logits, loss = model(x, y)
@@ -366,22 +467,11 @@ if __name__ == "__main__":
                     val_loss_accum += loss.detach()
             if ddp:
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            last_val_loss = val_loss_accum.item()
             if master_process:
-                print(f"validation loss: {val_loss_accum.item():.4f}")
+                print(f"validation loss: {last_val_loss:.4f}")
                 with open(log_file, "a") as f:
-                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-                if step > 0 and (step % 5000 == 0 or last_step):
-                    # optionally write model checkpoints
-                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'config': raw_model.config,
-                        'step': step,
-                        'val_loss': val_loss_accum.item()
-                    }
-                    # you might also want to add optimizer.state_dict() and
-                    # rng seeds etc., if you wanted to more exactly resume training
-                    torch.save(checkpoint, checkpoint_path)
+                    f.write(f"{step} val {last_val_loss:.4f}\n")
 
         if step % 250 == 0 or last_step:
             num_correct_norm = 0
@@ -442,11 +532,13 @@ if __name__ == "__main__":
                 print(f"rank {ddp_rank} sample {i}: {decoded}")
 
 
+        B, grad_accum_steps, tokens_seen = plan[step]
+        step_tokens = B * T * grad_accum_steps * ddp_world_size
         model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
         for micro_step in range(grad_accum_steps):
-            x, y = train_loader.next_batch()
+            x, y = train_loader.next_batch(B)
             x, y = x.to(device), y.to(device)
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 logits, loss = model(x, y)
@@ -466,12 +558,28 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
         t1 = time.time()
         dt = (t1 - t0)
-        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
-        tokens_per_sec = tokens_processed / dt
+        tokens_per_sec = step_tokens / dt
         if master_process:
-            print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/s: {tokens_per_sec:.2f}")
+            print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | batch: {step_tokens:,} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/s: {tokens_per_sec:.2f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} train {loss_accum.item():.6f}\n")
+
+        # checkpoint at the end of every epoch
+        if step in epoch_end_steps and master_process:
+            epoch = epoch_end_steps[step]
+            assert train_loader.epoch == epoch, "data loader out of sync with the precomputed plan"
+            checkpoint_path = os.path.join(log_dir, f"model_epoch{epoch}.pt")
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'config': raw_model.config,
+                'step': step,
+                'epoch': epoch,
+                'tokens_seen': tokens_seen + step_tokens,
+                'val_loss': last_val_loss,  # from the most recent eval (every 250 steps)
+            }
+            torch.save(checkpoint, checkpoint_path)
+            print(f"saved checkpoint for epoch {epoch} to {checkpoint_path}")
 
 
     if ddp:
